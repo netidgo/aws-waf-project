@@ -1,0 +1,165 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: Default EC2_Layer Template for the Project
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Project Name
+    Default: waf
+  RdsDns:
+    Type: String
+    Description: RDS Endpoint
+
+Mappings:
+  CidrMap:
+    ap-northeast-2:
+      VpcCidr: 172.16.0.0/16
+      PubSn1Cidr: 172.16.1.0/24
+      PubSn2Cidr: 172.16.2.0/24
+      WebSn3Cidr: 172.16.3.0/24
+      WebSn4Cidr: 172.16.4.0/24
+  AmiMap:
+    ap-northeast-2:
+      Ami: ami-0c003e98ceffee43e
+
+Resources:
+# Web Application Load Balancer & Security Group
+  WebAlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !ImportValue VpcId
+      GroupDescription: !Sub "${AWS::Region} Web ALB Security Group"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key : Name
+          Value : !Sub "${ProjectName}-web-alb-sg"
+
+  WebAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Name: !Sub "${ProjectName}-web-alb"
+      SecurityGroups:
+        - !Ref WebAlbSg
+      Subnets:
+        - !ImportValue PubSn1Id
+        - !ImportValue PubSn2Id
+
+  WebAlbTg:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-web-tg"
+      Port: 80
+      Protocol: HTTP
+      HealthCheckPath: '/'
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 3
+      VpcId: !ImportValue VpcId
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: true
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: 3600
+      Tags:
+        - Key : Name
+          Value : !Sub "${ProjectName}-web-tg"
+
+  WebAlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebAlbTg
+      LoadBalancerArn: !Ref WebAlb
+      Port: 80
+      Protocol: HTTP
+
+# LaunchTemplate & Security Group
+  WebSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !ImportValue VpcId
+      GroupDescription: !Sub "Web Instance Security Group"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !FindInMap [CidrMap, ap-northeast-2, PubSn2Cidr]
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref WebAlbSg
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref WebAlbSg
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 10.0.0.0/8
+      Tags:
+        - Key : Name
+          Value : !Sub "${ProjectName}-web-sg"
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectName}-lt"
+      VersionDescription: version 1.0
+      LaunchTemplateData:
+        ImageId: !FindInMap [AmiMap, !Ref "AWS::Region", Ami]
+        InstanceType: t3.micro
+        KeyName: !Sub "${ProjectName}-key"
+        SecurityGroupIds:
+          - !Ref WebSg
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum install -y httpd php php-mbstring php-pdo php-mysqlnd php-json php-gd
+            systemctl start httpd
+            systemctl enable httpd
+            wget https://github.com/netidgo/aws-waf-project/raw/refs/heads/main/frontend_source.zip
+            mv frontend_source.zip /var/www/html/
+            cd /var/www/html/
+            unzip frontend_source.zip
+            sed -i "s/localhost/${RdsDns}/g" config.php
+
+# Auto Scaling Group & Scaling Policy
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${ProjectName}-asg"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - !ImportValue WebSn3Id
+        - !ImportValue WebSn4Id
+      TargetGroupARNs:
+        - !Ref WebAlbTg
+      DesiredCapacity: 2
+      MinSize: 2
+      MaxSize: 4
+
+  ScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50
+...
